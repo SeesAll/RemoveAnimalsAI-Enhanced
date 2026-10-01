@@ -13,10 +13,12 @@ using System.Linq;
 
 namespace Oxide.Plugins
 {
-    [Info("Remove Animals AI", "Whipers88 @CobaltStudios, modified by SeesAll", "2.0.0")]
+    [Info("Remove Animals AI", "Whipers88 @CobaltStudios, modified by SeesAll", "2.1.0")]
     [Description("Selectively disables animal AI while leaving human NPC AI untouched.")]
     public class RemoveAnimalsAI : RustPlugin
     {
+        private const int CurrentConfigurationVersion = 2;
+
         private const string ModeSelective = "Selective";
         private const string ModeDisableAll = "DisableAll";
         private const string ModeVanilla = "Vanilla";
@@ -32,9 +34,28 @@ namespace Oxide.Plugins
         private static RemoveAnimalsAI Instance;
 
         private Configuration _config;
-        private readonly HashSet<BaseEntity> _disabledEntities = new HashSet<BaseEntity>();
+        private readonly Dictionary<BaseEntity, bool> _animalPolicyCache = new Dictionary<BaseEntity, bool>();
+        private readonly Dictionary<BaseEntity, DisabledAnimalState> _disabledAnimalStates =
+            new Dictionary<BaseEntity, DisabledAnimalState>();
+        private readonly HashSet<BaseEntity> _deathProcessingEntities = new HashSet<BaseEntity>();
+        private readonly HashSet<string> _unsupportedControllerWarnings =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        private string[] _excludedPrefabTokens = new string[0];
+        private string _activeMode = ModeSelective;
         private bool _configSaveQueued;
         private bool _shuttingDown;
+        private bool _unloading;
+
+        private sealed class DisabledAnimalState
+        {
+            public bool HadBrain;
+            public bool BrainEnabled;
+            public bool HadFsm;
+            public bool FsmRunning;
+            public bool WasQueued;
+            public bool HadLegacyNpc;
+            public bool LegacyTickWasInvoking;
+        }
 
         private sealed class SpeciesDefinition
         {
@@ -82,7 +103,7 @@ namespace Oxide.Plugins
         private sealed class Configuration
         {
             [JsonProperty("Configuration Version")]
-            public int ConfigurationVersion = 1;
+            public int ConfigurationVersion = CurrentConfigurationVersion;
 
             [JsonProperty("Mode (Selective, DisableAll, or Vanilla)")]
             public string Mode = ModeSelective;
@@ -92,6 +113,12 @@ namespace Oxide.Plugins
 
             [JsonProperty("Log Newly Discovered Animal Prefabs")]
             public bool LogNewlyDiscoveredAnimalPrefabs = true;
+
+            [JsonProperty("Repair Enabled Animal Controllers On Plugin Load")]
+            public bool RepairEnabledAnimalControllersOnPluginLoad = true;
+
+            [JsonProperty("Never Manage Prefab Name Contains")]
+            public List<string> NeverManagePrefabNameContains = CreateDefaultExcludedPrefabTokens();
 
             [JsonProperty("Category AI Enabled")]
             public Dictionary<string, bool> CategoryAiEnabled = CreateDefaultCategories();
@@ -113,9 +140,9 @@ namespace Oxide.Plugins
             {
                 bool changed = false;
 
-                if (ConfigurationVersion < 1)
+                if (ConfigurationVersion < CurrentConfigurationVersion)
                 {
-                    ConfigurationVersion = 1;
+                    ConfigurationVersion = CurrentConfigurationVersion;
                     changed = true;
                 }
 
@@ -124,9 +151,28 @@ namespace Oxide.Plugins
                     Mode = ModeSelective;
                     changed = true;
                 }
+                else
+                {
+                    string canonicalMode = CanonicalizeMode(Mode);
+                    if (!string.Equals(Mode, canonicalMode, StringComparison.Ordinal))
+                    {
+                        Mode = canonicalMode;
+                        changed = true;
+                    }
+                }
 
                 CategoryAiEnabled = NormalizeDictionary(CategoryAiEnabled, ref changed);
                 AnimalAiOverrides = NormalizeDictionary(AnimalAiOverrides, ref changed);
+                NeverManagePrefabNameContains = NormalizeList(NeverManagePrefabNameContains, ref changed);
+
+                foreach (string token in CreateDefaultExcludedPrefabTokens())
+                {
+                    if (!NeverManagePrefabNameContains.Contains(token, StringComparer.OrdinalIgnoreCase))
+                    {
+                        NeverManagePrefabNameContains.Add(token);
+                        changed = true;
+                    }
+                }
 
                 foreach (KeyValuePair<string, bool> entry in CreateDefaultCategories())
                 {
@@ -147,6 +193,20 @@ namespace Oxide.Plugins
                 }
 
                 return changed;
+            }
+
+            private static string CanonicalizeMode(string value)
+            {
+                string configured = (value ?? string.Empty).Trim();
+                if (configured.Equals(ModeDisableAll, StringComparison.OrdinalIgnoreCase))
+                {
+                    return ModeDisableAll;
+                }
+                if (configured.Equals(ModeVanilla, StringComparison.OrdinalIgnoreCase))
+                {
+                    return ModeVanilla;
+                }
+                return ModeSelective;
             }
 
             private static Dictionary<string, bool> CreateDefaultCategories()
@@ -170,6 +230,53 @@ namespace Oxide.Plugins
                     result[species.Name] = null;
                 }
                 return result;
+            }
+
+            private static List<string> CreateDefaultExcludedPrefabTokens()
+            {
+                return new List<string>
+                {
+                    "scientist",
+                    "murderer",
+                    "scarecrow",
+                    "caveman",
+                    "npcplayer",
+                    "bandit",
+                    "outbreak",
+                    "dweller",
+                    "peacekeeper",
+                    "vendor"
+                };
+            }
+
+            private static List<string> NormalizeList(IEnumerable<string> source, ref bool changed)
+            {
+                List<string> normalized = new List<string>();
+                HashSet<string> seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                if (source == null)
+                {
+                    changed = true;
+                    return normalized;
+                }
+
+                foreach (string value in source)
+                {
+                    string token = value == null ? string.Empty : value.Trim();
+                    if (token.Length == 0 || !seen.Add(token))
+                    {
+                        changed = true;
+                        continue;
+                    }
+
+                    if (!string.Equals(token, value, StringComparison.Ordinal))
+                    {
+                        changed = true;
+                    }
+                    normalized.Add(token);
+                }
+
+                return normalized;
             }
 
             private static Dictionary<string, TValue> NormalizeDictionary<TValue>(IDictionary<string, TValue> source, ref bool changed)
@@ -212,6 +319,7 @@ namespace Oxide.Plugins
         protected override void LoadDefaultConfig()
         {
             _config = Configuration.CreateDefault();
+            RefreshRuntimeConfigCache();
             SaveConfig();
         }
 
@@ -242,11 +350,29 @@ namespace Oxide.Plugins
                 PrintWarning("Configuration was merged with newly available settings; existing values were preserved.");
                 SaveConfig();
             }
+
+            RefreshRuntimeConfigCache();
         }
 
         protected override void SaveConfig()
         {
             Config.WriteObject(_config, true);
+        }
+
+        private void RefreshRuntimeConfigCache()
+        {
+            string configuredMode = (_config.Mode ?? string.Empty).Trim();
+            _activeMode = configuredMode.Equals(ModeDisableAll, StringComparison.OrdinalIgnoreCase)
+                ? ModeDisableAll
+                : configuredMode.Equals(ModeVanilla, StringComparison.OrdinalIgnoreCase)
+                    ? ModeVanilla
+                    : ModeSelective;
+
+            _excludedPrefabTokens = _config.NeverManagePrefabNameContains
+                .Select(NormalizeName)
+                .Where(token => token.Length > 0)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
+                .ToArray();
         }
 
         private void Init()
@@ -269,13 +395,38 @@ namespace Oxide.Plugins
 
                 animals++;
                 EnsureAnimalConfigEntry(species, entity.ShortPrefabName, category);
-                if (ApplyAnimalPolicy(entity, species, category))
+                bool aiDisabled = ApplyAnimalPolicy(
+                    entity,
+                    species,
+                    category,
+                    _config.RepairEnabledAnimalControllersOnPluginLoad);
+                if (aiDisabled)
                 {
                     disabled++;
                 }
+                WarnIfUnsupportedController(entity, species, aiDisabled);
             }
 
             Puts($"Mode={GetMode()}. Detected {animals} animal(s); AI disabled for {disabled}.");
+        }
+
+        private static bool HasSupportedAiController(BaseEntity entity)
+        {
+            return entity is BaseNpc ||
+                   entity.GetComponent<FSMComponent>() != null ||
+                   entity.GetComponent<BaseAIBrain>() != null;
+        }
+
+        private void WarnIfUnsupportedController(BaseEntity entity, string species, bool aiDisabled)
+        {
+            if (!aiDisabled || GetMode() != ModeSelective || HasSupportedAiController(entity) ||
+                !_unsupportedControllerWarnings.Add(species))
+            {
+                return;
+            }
+
+            PrintWarning($"Configured-disabled animal '{species}' uses no recognized AI controller and may " +
+                         "require a compatibility update.");
         }
 
         private void OnServerShutdown()
@@ -285,6 +436,8 @@ namespace Oxide.Plugins
 
         private void Unload()
         {
+            _unloading = true;
+
             // Let restoration calls pass through our own Harmony prefixes.
             Instance = null;
 
@@ -293,41 +446,95 @@ namespace Oxide.Plugins
                 RestoreDisabledAnimals();
             }
 
-            _disabledEntities.Clear();
+            _disabledAnimalStates.Clear();
+            _animalPolicyCache.Clear();
+            _deathProcessingEntities.Clear();
+            _unsupportedControllerWarnings.Clear();
         }
 
         private void OnEntitySpawned(BaseNetworkable networkable)
         {
             BaseEntity entity = networkable as BaseEntity;
-            if (entity == null)
+            if (entity == null || !IsPotentialAnimalCandidate(entity))
             {
                 return;
             }
 
             NextTick(() =>
             {
-                if (entity == null || entity.IsDestroyed || !TryGetAnimalIdentity(entity, out string species, out string category))
+                if (_unloading || entity == null || entity.IsDestroyed ||
+                    !TryGetAnimalIdentity(entity, out string species, out string category))
                 {
                     return;
                 }
 
                 EnsureAnimalConfigEntry(species, entity.ShortPrefabName, category);
-                ApplyAnimalPolicy(entity, species, category);
+                bool aiDisabled = ApplyAnimalPolicy(entity, species, category);
+                WarnIfUnsupportedController(entity, species, aiDisabled);
             });
+        }
+
+        private bool IsPotentialAnimalCandidate(BaseEntity entity)
+        {
+            if (entity == null || entity is BasePlayer || entity is ScientistNPC2)
+            {
+                return false;
+            }
+
+            string normalized = NormalizeName(entity.ShortPrefabName);
+            if (normalized.Length == 0 || IsExcludedEntityName(normalized) || IsHumanNpcName(normalized))
+            {
+                return false;
+            }
+
+            if (FindKnownSpecies(entity, normalized) != null)
+            {
+                return true;
+            }
+
+            return entity is BaseAnimalNPC ||
+                   entity is BaseNpc ||
+                   entity.GetComponent<AnimalBrain>() != null;
         }
 
         private void OnEntityKill(BaseNetworkable networkable)
         {
             BaseEntity entity = networkable as BaseEntity;
-            if (entity != null)
+            if (!ReferenceEquals(entity, null))
             {
-                _disabledEntities.Remove(entity);
+                _disabledAnimalStates.Remove(entity);
+                _animalPolicyCache.Remove(entity);
+                _deathProcessingEntities.Remove(entity);
             }
         }
 
-        private bool ApplyAnimalPolicy(BaseEntity entity, string species = null, string category = null)
+        private void BeginDeathProcessing(BaseEntity entity)
+        {
+            if (entity == null || !_deathProcessingEntities.Add(entity))
+            {
+                return;
+            }
+
+            // OnEntityKill normally removes this immediately after the corpse
+            // is created. The timeout prevents an unexpected modded death flow
+            // from retaining a dead entity reference indefinitely.
+            timer.Once(60f, () => _deathProcessingEntities.Remove(entity));
+        }
+
+        private bool ApplyAnimalPolicy(
+            BaseEntity entity,
+            string species = null,
+            string category = null,
+            bool repairEnabledController = false)
         {
             if (entity == null || entity.IsDestroyed)
+            {
+                return false;
+            }
+
+            // Once a disabled animal dies, Rust must be allowed to run its
+            // normal death FSM so the harvestable corpse and yields are made.
+            if (_deathProcessingEntities.Contains(entity))
             {
                 return false;
             }
@@ -339,15 +546,45 @@ namespace Oxide.Plugins
 
             if (IsAiEnabled(species, category))
             {
-                _disabledEntities.Remove(entity);
+                _animalPolicyCache[entity] = false;
+                if (repairEnabledController)
+                {
+                    RepairEnabledAnimalController(entity);
+                }
                 return false;
             }
 
-            _disabledEntities.Add(entity);
+            _animalPolicyCache[entity] = true;
+
+            if (!_disabledAnimalStates.TryGetValue(entity, out DisabledAnimalState state))
+            {
+                state = new DisabledAnimalState();
+                _disabledAnimalStates.Add(entity, state);
+            }
+
+            // Components can be added at different points in Rust's spawn
+            // pipeline. Capture each original state the first time it exists.
+            if (!state.HadBrain && entity.TryGetComponent<BaseAIBrain>(out BaseAIBrain existingBrain))
+            {
+                state.HadBrain = true;
+                state.BrainEnabled = existingBrain.enabled;
+            }
+
+            if (!state.HadFsm && entity.TryGetComponent<FSMComponent>(out FSMComponent existingFsm))
+            {
+                state.HadFsm = true;
+                state.FsmRunning = existingFsm.isRunning;
+                state.WasQueued = existingFsm.workQueue != null && existingFsm.workQueue.Contains(existingFsm);
+            }
 
             BaseNpc legacyNpc = entity as BaseNpc;
             if (legacyNpc != null)
             {
+                if (!state.HadLegacyNpc)
+                {
+                    state.HadLegacyNpc = true;
+                    state.LegacyTickWasInvoking = legacyNpc.IsInvoking(legacyNpc.TickAi);
+                }
                 legacyNpc.CancelInvoke(legacyNpc.TickAi);
             }
 
@@ -369,6 +606,38 @@ namespace Oxide.Plugins
             return true;
         }
 
+        private static void RepairEnabledAnimalController(BaseEntity entity)
+        {
+            // Older releases disabled every animal without restoring the
+            // legacy TickAi schedule when they were replaced. Repairing only
+            // configured-enabled animals on plugin load makes that migration
+            // reversible without affecting species that remain disabled.
+            if (entity.TryGetComponent<BaseAIBrain>(out BaseAIBrain brain) && !brain.enabled)
+            {
+                brain.enabled = true;
+            }
+
+            if (entity.TryGetComponent<FSMComponent>(out FSMComponent fsm))
+            {
+                if (!fsm.isRunning)
+                {
+                    fsm.SetFsmActive(true);
+                    fsm.isRunning = true;
+                }
+
+                if (fsm.workQueue != null && !fsm.workQueue.Contains(fsm))
+                {
+                    fsm.workQueue.Add(fsm);
+                }
+            }
+
+            BaseNpc legacyNpc = entity as BaseNpc;
+            if (legacyNpc != null && !legacyNpc.IsInvoking(legacyNpc.TickAi))
+            {
+                legacyNpc.InvokeRandomized(legacyNpc.TickAi, 0.1f, 0.1f, 0.005f);
+            }
+        }
+
         private bool ShouldDisable(BaseEntity entity)
         {
             if (entity == null || entity.IsDestroyed)
@@ -376,9 +645,14 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            if (_disabledEntities.Contains(entity))
+            if (_deathProcessingEntities.Contains(entity))
             {
-                return true;
+                return false;
+            }
+
+            if (_animalPolicyCache.TryGetValue(entity, out bool disabledByPolicy))
+            {
+                return disabledByPolicy;
             }
 
             if (!TryGetAnimalIdentity(entity, out string species, out string category))
@@ -386,12 +660,13 @@ namespace Oxide.Plugins
                 return false;
             }
 
-            bool disabled = !IsAiEnabled(species, category);
-            if (disabled)
+            if (IsAiEnabled(species, category))
             {
-                _disabledEntities.Add(entity);
+                _animalPolicyCache[entity] = false;
+                return false;
             }
-            return disabled;
+
+            return ApplyAnimalPolicy(entity, species, category);
         }
 
         private bool IsAiEnabled(string species, string category)
@@ -426,16 +701,7 @@ namespace Oxide.Plugins
 
         private string GetMode()
         {
-            string configured = (_config.Mode ?? string.Empty).Trim();
-            if (configured.Equals(ModeDisableAll, StringComparison.OrdinalIgnoreCase))
-            {
-                return ModeDisableAll;
-            }
-            if (configured.Equals(ModeVanilla, StringComparison.OrdinalIgnoreCase))
-            {
-                return ModeVanilla;
-            }
-            return ModeSelective;
+            return _activeMode;
         }
 
         private bool TryGetAnimalIdentity(BaseEntity entity, out string species, out string category)
@@ -458,7 +724,7 @@ namespace Oxide.Plugins
             // Some current Rust animals (notably horses and snakes) no longer
             // share the legacy animal component hierarchy. Explicit prefab
             // recognition must therefore happen before the component fallback.
-            SpeciesDefinition definition = FindKnownSpecies(normalized);
+            SpeciesDefinition definition = FindKnownSpecies(entity, normalized);
             if (definition != null)
             {
                 species = definition.Name;
@@ -468,7 +734,6 @@ namespace Oxide.Plugins
 
             bool animalComponent = entity is BaseAnimalNPC ||
                                    entity is BaseNpc ||
-                                   entity is BaseNPC2 ||
                                    entity.GetComponent<AnimalBrain>() != null;
 
             if (!animalComponent)
@@ -481,13 +746,23 @@ namespace Oxide.Plugins
             return true;
         }
 
-        private static SpeciesDefinition FindKnownSpecies(string normalizedPrefab)
+        private static SpeciesDefinition FindKnownSpecies(BaseEntity entity, string normalizedPrefab)
         {
+            string normalizedRuntimeType = NormalizeName(entity?.GetType().Name);
+            bool hasAnimalController = entity is BaseAnimalNPC ||
+                                       entity is BaseNpc ||
+                                       entity?.GetComponent<AnimalBrain>() != null;
+
             foreach (SpeciesDefinition definition in KnownSpecies)
             {
                 foreach (string token in definition.MatchTokens)
                 {
-                    if (normalizedPrefab.Contains(token))
+                    // Require both a matching prefab name and animal-like
+                    // runtime evidence. This prevents names such as
+                    // "dashboard" (contains "boar") and airwolf spawners from
+                    // being managed as animals.
+                    if (normalizedPrefab.Contains(token) &&
+                        (normalizedRuntimeType.Contains(token) || hasAnimalController))
                     {
                         return definition;
                     }
@@ -517,18 +792,16 @@ namespace Oxide.Plugins
                    normalizedName.Contains("trophy");
         }
 
-        private static bool IsHumanNpcName(string normalizedName)
+        private bool IsHumanNpcName(string normalizedName)
         {
-            return normalizedName.Contains("scientist") ||
-                   normalizedName.Contains("murderer") ||
-                   normalizedName.Contains("scarecrow") ||
-                   normalizedName.Contains("caveman") ||
-                   normalizedName.Contains("npcplayer") ||
-                   normalizedName.Contains("bandit") ||
-                   normalizedName.Contains("outbreak") ||
-                   normalizedName.Contains("dweller") ||
-                   normalizedName.Contains("peacekeeper") ||
-                   normalizedName.Contains("vendor");
+            foreach (string token in _excludedPrefabTokens)
+            {
+                if (normalizedName.Contains(token))
+                {
+                    return true;
+                }
+            }
+            return false;
         }
 
         private void EnsureAnimalConfigEntry(string species, string prefab, string category)
@@ -543,7 +816,8 @@ namespace Oxide.Plugins
 
             if (_config.LogNewlyDiscoveredAnimalPrefabs)
             {
-                Puts($"Discovered animal '{species}' (prefab '{prefab}', category '{category}'). Added a null override without changing its effective setting.");
+                Puts($"Discovered animal '{species}' (prefab '{prefab}', category '{category}'). " +
+                     "Added a null override without changing its effective setting.");
             }
         }
 
@@ -558,31 +832,56 @@ namespace Oxide.Plugins
             timer.Once(1f, () =>
             {
                 _configSaveQueued = false;
+                if (_unloading)
+                {
+                    return;
+                }
                 SaveConfig();
             });
         }
 
         private void RestoreDisabledAnimals()
         {
-            foreach (BaseEntity entity in _disabledEntities.ToArray())
+            foreach (KeyValuePair<BaseEntity, DisabledAnimalState> entry in _disabledAnimalStates.ToArray())
             {
-                if (entity == null || entity.IsDestroyed)
+                BaseEntity entity = entry.Key;
+                DisabledAnimalState state = entry.Value;
+                if (entity == null || entity.IsDestroyed || _deathProcessingEntities.Contains(entity))
                 {
                     continue;
                 }
 
-                if (entity.TryGetComponent<BaseAIBrain>(out BaseAIBrain brain))
+                if (state.HadBrain && entity.TryGetComponent<BaseAIBrain>(out BaseAIBrain brain))
                 {
-                    brain.enabled = true;
+                    brain.enabled = state.BrainEnabled;
                 }
 
-                if (entity.TryGetComponent<FSMComponent>(out FSMComponent fsm))
+                BaseNpc legacyNpc = entity as BaseNpc;
+                if (state.HadLegacyNpc && state.LegacyTickWasInvoking && legacyNpc != null && !legacyNpc.IsInvoking(legacyNpc.TickAi))
                 {
-                    fsm.isRunning = true;
-                    fsm.SetFsmActive(true);
-                    if (fsm.workQueue != null && !fsm.workQueue.Contains(fsm))
+                    // Mirrors BaseNpc.ServerInit. Restoring this timer makes
+                    // switching to Vanilla mode reversible without a restart.
+                    legacyNpc.InvokeRandomized(legacyNpc.TickAi, 0.1f, 0.1f, 0.005f);
+                }
+
+                if (state.HadFsm && entity.TryGetComponent<FSMComponent>(out FSMComponent fsm))
+                {
+                    fsm.SetFsmActive(state.FsmRunning);
+                    fsm.isRunning = state.FsmRunning;
+
+                    if (fsm.workQueue == null)
+                    {
+                        continue;
+                    }
+
+                    bool isQueued = fsm.workQueue.Contains(fsm);
+                    if (state.WasQueued && !isQueued)
                     {
                         fsm.workQueue.Add(fsm);
+                    }
+                    else if (!state.WasQueued && isQueued)
+                    {
+                        fsm.workQueue.Remove(fsm);
                     }
                 }
             }
@@ -592,6 +891,11 @@ namespace Oxide.Plugins
         {
             Dictionary<string, int> counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             Dictionary<string, string> categories = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<string, HashSet<string>> runtimeIdentities =
+                new Dictionary<string, HashSet<string>>(StringComparer.OrdinalIgnoreCase);
+            int enabledCount = 0;
+            int disabledCount = 0;
+            int unknownCount = 0;
 
             foreach (BaseNetworkable networkable in BaseNetworkable.serverEntities)
             {
@@ -603,17 +907,42 @@ namespace Oxide.Plugins
 
                 counts[species] = counts.TryGetValue(species, out int count) ? count + 1 : 1;
                 categories[species] = category;
+
+                if (!runtimeIdentities.TryGetValue(species, out HashSet<string> identities))
+                {
+                    identities = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    runtimeIdentities.Add(species, identities);
+                }
+                identities.Add($"{entity.ShortPrefabName} [{entity.GetType().Name}]");
+
+                if (category.Equals(CategoryUnknown, StringComparison.OrdinalIgnoreCase))
+                {
+                    unknownCount++;
+                }
+
+                if (IsAiEnabled(species, category))
+                {
+                    enabledCount++;
+                }
+                else
+                {
+                    disabledCount++;
+                }
             }
 
             List<string> lines = new List<string>
             {
-                $"Remove Animals AI v{Version} | Mode={GetMode()} | Detected={counts.Values.Sum()}"
+                $"Remove Animals AI v{Version} | Mode={GetMode()} | Detected={counts.Values.Sum()} | " +
+                $"AI enabled={enabledCount} | AI disabled={disabledCount} | Unknown={unknownCount}"
             };
 
             foreach (string species in counts.Keys.OrderBy(value => value))
             {
                 string category = categories[species];
-                lines.Add($"{species}: count={counts[species]}, category={category}, AI={(IsAiEnabled(species, category) ? "enabled" : "disabled")}");
+                string identities = string.Join(", ", runtimeIdentities[species].OrderBy(value => value));
+                string aiState = IsAiEnabled(species, category) ? "enabled" : "disabled";
+                lines.Add($"{species}: count={counts[species]}, category={category}, " +
+                          $"AI={aiState}, runtime={identities}");
             }
 
             if (counts.Count == 0)
@@ -657,9 +986,9 @@ namespace Oxide.Plugins
             [HarmonyPostfix]
             private static void Postfix(BaseNpc __instance)
             {
-                if (Instance != null && Instance.ShouldDisable(__instance))
+                if (Instance != null)
                 {
-                    __instance.CancelInvoke(__instance.TickAi);
+                    Instance.ShouldDisable(__instance);
                 }
             }
         }
@@ -723,6 +1052,11 @@ namespace Oxide.Plugins
                 {
                     return;
                 }
+
+                // From this point onward all of our activation guards allow
+                // Rust's vanilla death transition to finish. Enabled animals
+                // never enter this set and remain completely vanilla.
+                Instance.BeginDeathProcessing(__instance);
 
                 if (__instance.TryGetComponent<FSMComponent>(out FSMComponent fsm) && fsm.workQueue != null)
                 {
